@@ -1,0 +1,14 @@
+babafrar_results/
+results/
+logs/
+*.log
+*.tmp
+*.bak
+.env
+*.env
+cookies.txt
+headers.txt
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
