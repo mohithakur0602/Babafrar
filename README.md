@@ -148,7 +148,7 @@ BABAFRAR uses the following tools:
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/BABAFRAR.git
+git clone https://github.com/mohithakur0602/BABAFRAR.git
 cd BABAFRAR
 ```
 
