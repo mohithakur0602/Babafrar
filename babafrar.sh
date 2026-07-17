@@ -137,7 +137,7 @@ check_babafrar_tools() {
     baba_say "Checking if the crew is ready..."
     
     local missing_crew=()
-    local crew_tools=("subfinder" "sublist3r" "dalfox" "httpx" "gau" "waybackurls" "anew" "qsreplace")
+    local crew_tools=("subfinder" "sublist3r" "dalfox" "nuclei" "httpx" "gau" "waybackurls" "anew" "qsreplace")
     
     for tool in "${crew_tools[@]}"; do
         if ! command -v "$tool" &>/dev/null; then
@@ -195,6 +195,7 @@ install_babafrar_tools() {
     local go_tools=(
         "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
         "github.com/projectdiscovery/httpx/cmd/httpx@latest"
+        "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
         "github.com/tomnomnom/anew@latest"
         "github.com/tomnomnom/qsreplace@latest"
         "github.com/hahwul/dalfox/v2@latest"
@@ -561,6 +562,331 @@ EOF
 }
 
 # ============================================================================
+# MODULE 5B: DALFOX RECON PREPARATION
+# ============================================================================
+module5b_prepare_dalfox_recon() {
+    local target="$1"
+
+    print_gangsta_section "MODULE 5B: PREPARING DALFOX RECON FILES"
+
+    module_timer_start
+
+    local analysis_dir="${BABAFRAR_RUN}/analysis"
+    local recon_dir="${analysis_dir}/dalfox_recon"
+    local final_review="${analysis_dir}/final_review.tsv"
+    local single_params="${BABAFRAR_RUN}/parameters/single_params.txt"
+    local reflected="${analysis_dir}/reflected.txt"
+    local split_params="${analysis_dir}/split_params.txt"
+    local best_file="${recon_dir}/dalfox_best.txt"
+
+    mkdir -p "$recon_dir"
+    rm -f "${recon_dir}"/*.txt 2>/dev/null || true
+
+    baba_say "Building DoctorJack recon files for Dalfox..."
+
+    if [ -f "$final_review" ] && [ -s "$final_review" ]; then
+        awk -F'\t' -v out="$recon_dir" '
+            NR == 1 { next }
+            NF >= 4 {
+                url = $1
+                type = tolower($3)
+                priority = tolower($4)
+                gsub(/[^a-z0-9]+/, "_", type)
+                gsub(/^_+|_+$/, "", type)
+
+                if (url != "") {
+                    print url >> out "/priority_" priority ".txt"
+                    print url >> out "/type_" type ".txt"
+                }
+            }
+        ' "$final_review"
+    fi
+
+    [ -f "$single_params" ] && sort -u "$single_params" > "${recon_dir}/all_params.txt"
+    [ -f "$split_params" ] && sort -u "$split_params" > "${recon_dir}/priority_params.txt"
+    [ -f "$reflected" ] && sort -u "$reflected" > "${recon_dir}/reflected_params.txt"
+
+    {
+        cat "${recon_dir}/reflected_params.txt" 2>/dev/null
+        cat "${recon_dir}/priority_critical.txt" 2>/dev/null
+        cat "${recon_dir}/priority_high.txt" 2>/dev/null
+        cat "${recon_dir}/priority_medium.txt" 2>/dev/null
+        cat "${recon_dir}/all_params.txt" 2>/dev/null
+    } | grep -E '^https?://.*\?.*=' | sort -u > "$best_file"
+
+    local all_count=$(wc -l < "${recon_dir}/all_params.txt" 2>/dev/null || echo 0)
+    local best_count=$(wc -l < "$best_file" 2>/dev/null || echo 0)
+    local reflected_count=$(wc -l < "${recon_dir}/reflected_params.txt" 2>/dev/null || echo 0)
+    local critical_count=$(wc -l < "${recon_dir}/priority_critical.txt" 2>/dev/null || echo 0)
+    local high_count=$(wc -l < "${recon_dir}/priority_high.txt" 2>/dev/null || echo 0)
+    local medium_count=$(wc -l < "${recon_dir}/priority_medium.txt" 2>/dev/null || echo 0)
+
+    baba_good "Dalfox recon files ready: ${GOLD}${recon_dir}${NC}"
+    baba_stats "BEST: ${GOLD}${best_count}${NC} | REFLECTED: ${GREEN}${reflected_count}${NC} | CRITICAL: ${RED}${critical_count}${NC} | HIGH: ${RED}${high_count}${NC} | MEDIUM: ${GREEN}${medium_count}${NC} | ALL: ${GOLD}${all_count}${NC}"
+
+    cat > "${recon_dir}/README.txt" << EOF
+BABAFRAR DALFOX RECON FILES
+Target: ${target}
+Date: $(date)
+
+Use dalfox_best.txt as the default Dalfox input.
+It is built in this order:
+1. Reflected URLs from DoctorJack sampling
+2. Critical priority URLs
+3. High priority URLs
+4. Medium priority URLs
+5. Remaining normalized parameter URLs
+
+Files:
+- dalfox_best.txt: Best all-in-one Dalfox input
+- reflected_params.txt: URLs where BABAFRAR_TEST reflected
+- priority_critical.txt: Critical DoctorJack candidates
+- priority_high.txt: High DoctorJack candidates
+- priority_medium.txt: Medium DoctorJack candidates
+- priority_params.txt: Critical + High + Medium candidates
+- all_params.txt: All normalized parameter URLs
+- type_*.txt: URL files grouped by DoctorJack parameter type
+EOF
+
+    echo "dalfox_recon_best:${best_count}" >> "${BABAFRAR_RUN}/logs/stats.txt"
+    echo "dalfox_recon_reflected:${reflected_count}" >> "${BABAFRAR_RUN}/logs/stats.txt"
+
+    module_timer_end "DALFOX RECON PREPARATION"
+}
+
+first_existing_nuclei_template_path() {
+    local fallback="$1"
+    shift
+
+    local candidate
+    for candidate in "$@"; do
+        if [ -e "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    echo "$fallback"
+}
+
+select_nuclei_vuln_template() {
+    local template_root="$1"
+    local choice="${NUCLEI_VULN_CHOICE:-}"
+    local custom_path=""
+
+    echo ""
+    echo -e "${CYAN}Choose Nuclei vulnerability scan:${NC}"
+    echo -e "  ${GREEN}1)${NC} All templates"
+    echo -e "  ${GREEN}2)${NC} XSS"
+    echo -e "  ${GREEN}3)${NC} SQL Injection"
+    echo -e "  ${GREEN}4)${NC} SSRF"
+    echo -e "  ${GREEN}5)${NC} LFI / File Inclusion"
+    echo -e "  ${GREEN}6)${NC} RCE"
+    echo -e "  ${GREEN}7)${NC} Open Redirect"
+    echo -e "  ${GREEN}8)${NC} CVEs"
+    echo -e "  ${GREEN}9)${NC} Exposures"
+    echo -e "  ${GREEN}10)${NC} Custom template path"
+    echo ""
+
+    if [ -z "$choice" ]; then
+        read -r -p "$(echo -e "${GOLD}Enter choice [1-10] (default: 1): ${NC}")" choice
+    fi
+
+    choice="${choice:-1}"
+
+    case "$choice" in
+        1|all)
+            NUCLEI_SELECTED_LABEL="all"
+            NUCLEI_SELECTED_TEMPLATE="$template_root"
+            ;;
+        2|xss)
+            NUCLEI_SELECTED_LABEL="xss"
+            NUCLEI_SELECTED_TEMPLATE=$(first_existing_nuclei_template_path \
+                "${template_root}/http/vulnerabilities/xss" \
+                "${template_root}/xss" \
+                "${template_root}/http/vulnerabilities/xss")
+            ;;
+        3|sqli|sql)
+            NUCLEI_SELECTED_LABEL="sqli"
+            NUCLEI_SELECTED_TEMPLATE=$(first_existing_nuclei_template_path \
+                "${template_root}/http/vulnerabilities/sqli" \
+                "${template_root}/sqli" \
+                "${template_root}/sql-injection" \
+                "${template_root}/http/vulnerabilities/sqli")
+            ;;
+        4|ssrf)
+            NUCLEI_SELECTED_LABEL="ssrf"
+            NUCLEI_SELECTED_TEMPLATE=$(first_existing_nuclei_template_path \
+                "${template_root}/http/vulnerabilities/ssrf" \
+                "${template_root}/ssrf" \
+                "${template_root}/http/vulnerabilities/ssrf")
+            ;;
+        5|lfi|file)
+            NUCLEI_SELECTED_LABEL="lfi"
+            NUCLEI_SELECTED_TEMPLATE=$(first_existing_nuclei_template_path \
+                "${template_root}/http/vulnerabilities/lfi" \
+                "${template_root}/lfi" \
+                "${template_root}/http/vulnerabilities/file-inclusion" \
+                "${template_root}/http/vulnerabilities/lfi")
+            ;;
+        6|rce)
+            NUCLEI_SELECTED_LABEL="rce"
+            NUCLEI_SELECTED_TEMPLATE=$(first_existing_nuclei_template_path \
+                "${template_root}/http/vulnerabilities/rce" \
+                "${template_root}/rce" \
+                "${template_root}/http/vulnerabilities/rce")
+            ;;
+        7|redirect|open-redirect)
+            NUCLEI_SELECTED_LABEL="open_redirect"
+            NUCLEI_SELECTED_TEMPLATE=$(first_existing_nuclei_template_path \
+                "${template_root}/http/vulnerabilities/open-redirect" \
+                "${template_root}/open-redirect" \
+                "${template_root}/http/vulnerabilities/open-redirect")
+            ;;
+        8|cve|cves)
+            NUCLEI_SELECTED_LABEL="cves"
+            NUCLEI_SELECTED_TEMPLATE=$(first_existing_nuclei_template_path \
+                "${template_root}/http/cves" \
+                "${template_root}/cves" \
+                "${template_root}/http/cves")
+            ;;
+        9|exposure|exposures)
+            NUCLEI_SELECTED_LABEL="exposures"
+            NUCLEI_SELECTED_TEMPLATE=$(first_existing_nuclei_template_path \
+                "${template_root}/http/exposures" \
+                "${template_root}/exposures" \
+                "${template_root}/http/exposures")
+            ;;
+        10|custom)
+            read -r -p "$(echo -e "${GOLD}Enter custom nuclei template file/dir: ${NC}")" custom_path
+            NUCLEI_SELECTED_LABEL="custom"
+            NUCLEI_SELECTED_TEMPLATE="$custom_path"
+            ;;
+        *)
+            baba_warn "Invalid choice. Using all templates."
+            NUCLEI_SELECTED_LABEL="all"
+            NUCLEI_SELECTED_TEMPLATE="$template_root"
+            ;;
+    esac
+
+    if [ -z "$NUCLEI_SELECTED_TEMPLATE" ]; then
+        baba_warn "Empty template path selected. Falling back to all templates."
+        NUCLEI_SELECTED_LABEL="all"
+        NUCLEI_SELECTED_TEMPLATE="$template_root"
+    fi
+
+    if [ ! -e "$NUCLEI_SELECTED_TEMPLATE" ]; then
+        baba_warn "Selected template path not found: ${NUCLEI_SELECTED_TEMPLATE}"
+        baba_info "Nuclei will still run with this path. Set NUCLEI_TEMPLATES if your templates are elsewhere."
+    fi
+}
+
+# ============================================================================
+# MODULE 5C: NUCLEI SCAN FROM DOCTORJACK URL FILES
+# ============================================================================
+module5c_nuclei_doctorjack_scan() {
+    local target="$1"
+
+    print_gangsta_section "MODULE 5C: NUCLEI SCAN FROM DOCTORJACK FILES"
+
+    module_timer_start
+
+    local analysis_dir="${BABAFRAR_RUN}/analysis"
+    local recon_dir="${analysis_dir}/dalfox_recon"
+    local output_dir="${BABAFRAR_RUN}/vulnerabilities/nuclei"
+    local input_file="${output_dir}/nuclei_doctorjack_input.txt"
+    local results_file="${output_dir}/results.txt"
+    local log_file="${output_dir}/nuclei_run.log"
+    local template_dir="${NUCLEI_TEMPLATES:-/usr/share/nuclei-templates}"
+    local severity="${NUCLEI_SEVERITY:-critical,high}"
+
+    mkdir -p "$output_dir"
+    : > "$input_file"
+    : > "$results_file"
+
+    if ! command -v nuclei >/dev/null 2>&1; then
+        baba_warn "nuclei not found. Skipping DoctorJack -> Nuclei scan."
+        baba_info "Install nuclei, then run: nuclei -l \"${input_file}\" -t \"${template_dir}\" -severity \"${severity}\" -o \"${results_file}\""
+        echo "nuclei_findings:0" >> "${BABAFRAR_RUN}/logs/stats.txt"
+        module_timer_end "NUCLEI DOCTORJACK SCAN"
+        return 0
+    fi
+
+    baba_say "Building Nuclei input from all DoctorJack URL files..."
+
+    {
+        awk -F'\t' 'NR > 1 && $1 ~ /^https?:\/\// { print $1 }' "${analysis_dir}/final_review.tsv" 2>/dev/null
+        cat "${recon_dir}/dalfox_best.txt" 2>/dev/null
+        cat "${recon_dir}/priority_params.txt" 2>/dev/null
+        cat "${analysis_dir}/split_params.txt" 2>/dev/null
+        cat "${analysis_dir}/clean.txt" 2>/dev/null
+        cat "${analysis_dir}/reflected.txt" 2>/dev/null
+        cat "${BABAFRAR_RUN}/parameters/single_params.txt" 2>/dev/null
+    } | grep -E '^https?://.*\?.*=' | sort -u > "$input_file"
+
+    local input_count=0
+    local findings_count=0
+    input_count=$(wc -l < "$input_file" 2>/dev/null || echo 0)
+
+    if [ "$input_count" -eq 0 ] 2>/dev/null; then
+        baba_warn "No DoctorJack URLs found for Nuclei."
+        echo "nuclei_findings:0" >> "${BABAFRAR_RUN}/logs/stats.txt"
+        module_timer_end "NUCLEI DOCTORJACK SCAN"
+        return 0
+    fi
+
+    select_nuclei_vuln_template "$template_dir"
+
+    baba_stats "Nuclei input URLs: ${GOLD}${input_count}${NC}"
+    baba_info "Input file: ${input_file}"
+    baba_info "Scan type: ${NUCLEI_SELECTED_LABEL}"
+    baba_info "Template path: ${NUCLEI_SELECTED_TEMPLATE}"
+    baba_info "Command: nuclei -l \"${input_file}\" -t \"${NUCLEI_SELECTED_TEMPLATE}\" -severity \"${severity}\" -o \"${results_file}\""
+
+    nuclei -l "$input_file" \
+        -t "$NUCLEI_SELECTED_TEMPLATE" \
+        -severity "$severity" \
+        -o "$results_file" \
+        2>&1 | tee "$log_file"
+
+    findings_count=$(wc -l < "$results_file" 2>/dev/null || echo 0)
+
+    cat > "${output_dir}/README.txt" << EOF
+BABAFRAR DOCTORJACK -> NUCLEI RESULTS
+Target: ${target}
+Date: $(date)
+
+Command:
+nuclei -l "${input_file}" -t "${NUCLEI_SELECTED_TEMPLATE}" -severity "${severity}" -o "${results_file}"
+
+Scan type: ${NUCLEI_SELECTED_LABEL}
+Template path: ${NUCLEI_SELECTED_TEMPLATE}
+
+Files:
+- nuclei_doctorjack_input.txt: Clean DoctorJack URL list used by Nuclei
+- results.txt: Nuclei findings
+- nuclei_run.log: Full Nuclei console output
+
+Input URLs: ${input_count}
+Findings lines: ${findings_count}
+
+Only test authorized targets.
+EOF
+
+    echo "nuclei_input:${input_count}" >> "${BABAFRAR_RUN}/logs/stats.txt"
+    echo "nuclei_scan_type:${NUCLEI_SELECTED_LABEL}" >> "${BABAFRAR_RUN}/logs/stats.txt"
+    echo "nuclei_findings:${findings_count}" >> "${BABAFRAR_RUN}/logs/stats.txt"
+
+    if [ "$findings_count" -gt 0 ] 2>/dev/null; then
+        baba_good "Nuclei findings saved: ${results_file}"
+    else
+        baba_warn "No critical/high Nuclei findings found."
+    fi
+
+    module_timer_end "NUCLEI DOCTORJACK SCAN"
+}
+
+# ============================================================================
 # MODULE 6: VULNERABILITY TESTING (ALL DALFOX FLAGS CORRECTED)
 # ============================================================================
 extract_dalfox_poc_blocks() {
@@ -608,6 +934,8 @@ module6_xss_testing() {
     module_timer_start
 
     local single_params="${BABAFRAR_RUN}/parameters/single_params.txt"
+    local dalfox_recon="${BABAFRAR_RUN}/analysis/dalfox_recon/dalfox_best.txt"
+    local recon_priority="${BABAFRAR_RUN}/analysis/dalfox_recon/priority_params.txt"
     local dalfox_params="${BABAFRAR_RUN}/parameters/dalfox_reachable_params.txt"
     local split_params="${BABAFRAR_RUN}/analysis/split_params.txt"
     local vuln_dir="${BABAFRAR_RUN}/vulnerabilities"
@@ -617,18 +945,27 @@ module6_xss_testing() {
     local summary_file="${vuln_dir}/dalfox_summary.txt"
     local raw_output_file="${vuln_dir}/dalfox_raw_output.txt"
     local all_urls="${BABAFRAR_RUN}/urls/raw_urls.txt"
+    local dalfox_source="$single_params"
 
     mkdir -p "$vuln_dir" "$log_dir"
     : > "$vuln_file"
     : > "$raw_output_file"
     : > "$poc_file"
 
+    if [ -f "$dalfox_recon" ] && [ -s "$dalfox_recon" ]; then
+        dalfox_source="$dalfox_recon"
+    fi
+
+    if [ -f "$recon_priority" ] && [ -s "$recon_priority" ]; then
+        split_params="$recon_priority"
+    fi
+
     local test_count=0
     local priority_count=0
     local total_urls=0
     local reachable_count=0
 
-    test_count=$(wc -l < "$single_params" 2>/dev/null || echo 0)
+    test_count=$(wc -l < "$dalfox_source" 2>/dev/null || echo 0)
     priority_count=$(wc -l < "$split_params" 2>/dev/null || echo 0)
     total_urls=$(wc -l < "$all_urls" 2>/dev/null || echo 0)
 
@@ -640,10 +977,10 @@ module6_xss_testing() {
         return 1
     fi
 
-    if [ -f "$single_params" ] && [ -s "$single_params" ]; then
+    if [ -f "$dalfox_source" ] && [ -s "$dalfox_source" ]; then
         if command -v httpx >/dev/null 2>&1; then
             baba_say "Filtering reachable parameter URLs before Dalfox..."
-            httpx -l "$single_params" \
+            httpx -l "$dalfox_source" \
                 -silent \
                 -no-color \
                 -timeout 8 \
@@ -652,18 +989,19 @@ module6_xss_testing() {
                 -o "$dalfox_params" 2>/dev/null || true
 
             if [ ! -s "$dalfox_params" ]; then
-                baba_warn "httpx found no reachable parameter URLs. Falling back to original single_params.txt"
-                cp "$single_params" "$dalfox_params" 2>/dev/null || true
+                baba_warn "httpx found no reachable parameter URLs. Falling back to DoctorJack/Dalfox source file"
+                cp "$dalfox_source" "$dalfox_params" 2>/dev/null || true
             fi
         else
-            baba_warn "httpx not found. Dalfox will test unfiltered single_params.txt"
-            cp "$single_params" "$dalfox_params" 2>/dev/null || true
+            baba_warn "httpx not found. Dalfox will test unfiltered DoctorJack/Dalfox source file"
+            cp "$dalfox_source" "$dalfox_params" 2>/dev/null || true
         fi
     fi
 
     reachable_count=$(wc -l < "$dalfox_params" 2>/dev/null || echo 0)
 
     echo ""
+    baba_stats "Dalfox source file: ${GOLD}${dalfox_source}${NC}"
     baba_stats "Parameter endpoints to test: ${GOLD}${test_count}${NC}"
     baba_stats "Reachable parameter endpoints: ${GOLD}${reachable_count}${NC}"
     baba_stats "Total raw URLs available: ${GOLD}${total_urls}${NC}"
@@ -870,6 +1208,7 @@ generate_babafrar_report() {
     local hitlist=$(grep "hitlist_total:" "${BABAFRAR_RUN}/logs/stats.txt" 2>/dev/null | cut -d: -f2 || echo 0)
     local critical=$(grep "critical:" "${BABAFRAR_RUN}/logs/stats.txt" 2>/dev/null | cut -d: -f2 || echo 0)
     local high=$(grep "high:" "${BABAFRAR_RUN}/logs/stats.txt" 2>/dev/null | cut -d: -f2 || echo 0)
+    local nuclei=$(grep "^nuclei_findings:" "${BABAFRAR_RUN}/logs/stats.txt" 2>/dev/null | tail -n1 | cut -d: -f2 || echo 0)
     local xss=$(grep "^xss_found:" "${BABAFRAR_RUN}/logs/stats.txt" 2>/dev/null | tail -n1 | cut -d: -f2 || echo 0)
     
     local total_duration=$(($(date +%s) - SCRIPT_START_TIME))
@@ -895,6 +1234,7 @@ Unique Parameter Endpoints: ${unique_params}
 Critical Priority: ${critical}
 High Priority: ${high}
 Total Hit List: ${hitlist}
+Nuclei Critical/High Findings: ${nuclei}
 XSS Vulnerabilities Found: ${xss}
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -974,7 +1314,7 @@ main_babafrar() {
     echo -e "${GOLD}╠══════════════════════════════════════════════════════╣${NC}"
     echo -e "${GOLD}║${NC}  Target: ${target}                    ${GOLD}║${NC}"
     echo -e "${GOLD}║${NC}  Est. Time: 2-4 hours (full scan)         ${GOLD}║${NC}"
-    echo -e "${GOLD}║${NC}  Modules: 6                            ${GOLD}║${NC}"
+    echo -e "${GOLD}║${NC}  Modules: 8                            ${GOLD}║${NC}"
     echo -e "${GOLD}╚══════════════════════════════════════════════════════╝${NC}"
     echo ""
     
@@ -983,6 +1323,8 @@ main_babafrar() {
     module3_parameter_discovery "$target"
     module4_parameter_processing
     module5_doctorjack_analysis
+    module5b_prepare_dalfox_recon "$target"
+    module5c_nuclei_doctorjack_scan "$target"
     module6_xss_testing "$target"
     generate_babafrar_report
     babafrar_cleanup
